@@ -1,0 +1,8 @@
+{
+  "checkpoint": "mobilenet_v3_small_best_20261126_100259.pth",
+  "best_validation_accuracy": 0.72125,
+  "best_epoch": {
+    "stage": "fine_tune",
+    "epoch": 9
+  }
+}

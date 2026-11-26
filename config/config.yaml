@@ -1,0 +1,35 @@
+data:
+  dataset_root: ~/datasets/asl_hg/splits
+  image_size: 224
+  num_classes: 36
+
+model:
+  architecture: mobilenet_v3_small
+  pretrained: true
+
+training:
+  batch_size: 32
+  num_workers: 4
+  stage1_epochs: 20
+  stage2_epochs: 10
+  stage1_learning_rate: 0.001
+  stage2_learning_rate: 0.00001
+  weight_decay: 0.0001
+  early_stopping_patience: 5
+  early_stopping_min_delta: 0.0001
+  scheduler_factor: 0.3
+  seed: 42
+  device: auto
+
+inference:
+  confidence_threshold: 0.60
+  camera_index: 0
+
+evaluation:
+  max_misclassified_samples: 25
+
+paths:
+  checkpoint_dir: models/checkpoints
+  log_dir: outputs/logs
+  plot_dir: outputs/plots
+  prediction_dir: outputs/predictions
