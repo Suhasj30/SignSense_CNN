@@ -1,4 +1,5 @@
 import { Camera, CircleCheck, Cpu, Menu, X } from 'lucide-react'
+import type { BackendHealth } from '../hooks/useBackendHealth'
 import type { View } from '../types'
 
 const pageCopy: Record<View, { title: string; subtitle: string }> = {
@@ -19,6 +20,7 @@ const pageCopy: Record<View, { title: string; subtitle: string }> = {
 interface DashboardHeaderProps {
   view: View
   cameraActive: boolean
+  backendHealth: BackendHealth
   onMobileMenu: () => void
   mobileMenuOpen: boolean
 }
@@ -26,10 +28,18 @@ interface DashboardHeaderProps {
 export function DashboardHeader({
   view,
   cameraActive,
+  backendHealth,
   onMobileMenu,
   mobileMenuOpen,
 }: DashboardHeaderProps) {
   const copy = pageCopy[view]
+  const backendLabel =
+    backendHealth.state === 'checking'
+      ? 'Checking backend'
+      : backendHealth.state === 'online'
+        ? `CNN online · ${backendHealth.device.toUpperCase()}`
+        : 'CNN backend offline'
+
   return (
     <header className="page-header">
       <button className="mobile-menu-button" onClick={onMobileMenu} aria-label="Toggle navigation">
@@ -41,9 +51,13 @@ export function DashboardHeader({
         <p>{copy.subtitle}</p>
       </div>
       <div className="header-status">
-        <div className="status-pill mock-pill">
+        <div
+          className={`status-pill${backendHealth.state === 'online' ? ' is-online' : ''}`}
+          role="status"
+          title={backendHealth.error || backendLabel}
+        >
           <Cpu size={15} />
-          <span><i /> Development mode</span>
+          <span><i /> {backendLabel}</span>
         </div>
         <div className={`status-pill${cameraActive ? ' is-online' : ''}`}>
           {cameraActive ? <CircleCheck size={15} /> : <Camera size={15} />}

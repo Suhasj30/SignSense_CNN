@@ -5,9 +5,6 @@ const STORAGE_KEY = 'signsense.settings.v1'
 export const defaultSettings: AppSettings = {
   speechEnabled: true,
   autoSpeak: false,
-  voiceURI: '',
-  speechRate: 1,
-  speechPitch: 1,
   confidenceThreshold: 0.72,
   recognitionCooldownMs: 1200,
   cameraDeviceId: '',
@@ -25,17 +22,6 @@ export function loadSettings(): AppSettings {
           : defaultSettings.speechEnabled,
       autoSpeak:
         typeof stored.autoSpeak === 'boolean' ? stored.autoSpeak : defaultSettings.autoSpeak,
-      voiceURI: typeof stored.voiceURI === 'string' ? stored.voiceURI : defaultSettings.voiceURI,
-      speechRate:
-        typeof stored.speechRate === 'number' && stored.speechRate >= 0.6 && stored.speechRate <= 1.5
-          ? stored.speechRate
-          : defaultSettings.speechRate,
-      speechPitch:
-        typeof stored.speechPitch === 'number' &&
-        stored.speechPitch >= 0.5 &&
-        stored.speechPitch <= 1.5
-          ? stored.speechPitch
-          : defaultSettings.speechPitch,
       confidenceThreshold:
         typeof stored.confidenceThreshold === 'number' &&
         stored.confidenceThreshold >= 0.5 &&

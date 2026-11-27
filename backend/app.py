@@ -12,12 +12,24 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from PIL import Image, UnidentifiedImageError
+from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from models.model import load_checkpoint_model
+from backend.tts_service import (
+    GeminiTTSAuthenticationError,
+    GeminiTTSGenerationError,
+    GeminiTTSNotConfiguredError,
+    GeminiTTSQuotaError,
+    GeminiTTSService,
+    GeminiTTSTimeoutError,
+    GeminiTTSUnavailableError,
+)
+from models.model import load_checkpoint_model, resolve_device
 from training.dataset import build_transform
 
 LOGGER = logging.getLogger("signsense.backend")
@@ -30,6 +42,13 @@ if not LOGGER.handlers:
     LOGGER.addHandler(log_handler)
 LOGGER.propagate = False
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def load_backend_environment() -> None:
+    load_dotenv(PROJECT_ROOT / ".env")
+
+
+load_backend_environment()
 DEFAULT_CHECKPOINT = (
     PROJECT_ROOT
     / "models"
@@ -56,6 +75,10 @@ class InvalidFrameError(ValueError):
     """Raised when an incoming WebSocket frame is invalid or unsupported."""
 
 
+class TTSRequest(BaseModel):
+    text: str = Field(max_length=1000)
+
+
 class InferenceRuntime:
     def __init__(self, checkpoint_path: Path) -> None:
         thread_count = int(
@@ -65,7 +88,8 @@ class InferenceRuntime:
             raise ValueError("SIGNSENSE_TORCH_THREADS must be at least 1")
         torch.set_num_threads(thread_count)
 
-        model, checkpoint = load_checkpoint_model(checkpoint_path, torch.device("cpu"))
+        self.device = resolve_device(os.environ.get("SIGNSENSE_DEVICE", "auto"))
+        model, checkpoint = load_checkpoint_model(checkpoint_path, self.device)
         raw_mapping = checkpoint["class_to_idx"]
         class_to_idx = {str(name): int(index) for name, index in raw_mapping.items()}
         if class_to_idx != EXPECTED_CLASS_TO_IDX:
@@ -108,7 +132,7 @@ class InferenceRuntime:
         ) as error:
             raise InvalidFrameError("Could not decode image frame.") from error
 
-        tensor = self.transform(rgb_image).unsqueeze(0)
+        tensor = self.transform(rgb_image).unsqueeze(0).to(self.device)
         with self.inference_lock, torch.inference_mode():
             logits = self.model(tensor)
             expected_shape = (1, len(self.idx_to_class))
@@ -132,6 +156,7 @@ class InferenceRuntime:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    load_backend_environment()
     checkpoint_path = Path(
         os.environ.get("SIGNSENSE_CHECKPOINT", str(DEFAULT_CHECKPOINT))
     ).expanduser()
@@ -139,22 +164,26 @@ async def lifespan(app: FastAPI):
         checkpoint_path = PROJECT_ROOT / checkpoint_path
     checkpoint_path = checkpoint_path.resolve()
 
-    LOGGER.info("Loading checkpoint from %s on CPU", checkpoint_path)
+    LOGGER.info("Loading checkpoint from %s", checkpoint_path)
     try:
         app.state.runtime = InferenceRuntime(checkpoint_path)
     except Exception:
         LOGGER.exception("Failed to load inference checkpoint from %s", checkpoint_path)
         raise
     LOGGER.info(
-        "Model loaded: architecture=%s classes=%d image_size=%d eval=%s",
+        "Model loaded: architecture=%s classes=%d image_size=%d device=%s eval=%s",
         app.state.runtime.architecture,
         len(app.state.runtime.idx_to_class),
         app.state.runtime.image_size,
+        app.state.runtime.device,
         not app.state.runtime.model.training,
     )
+    app.state.tts_service = GeminiTTSService()
     try:
         yield
     finally:
+        app.state.tts_service.close()
+        app.state.tts_service = None
         app.state.runtime = None
 
 
@@ -164,7 +193,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=app.state.allowed_origins,
     allow_credentials=False,
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -175,9 +204,62 @@ async def health() -> dict[str, Any]:
     return {
         "status": "ok" if runtime is not None else "unavailable",
         "model_loaded": runtime is not None,
-        "device": "cpu",
+        "device": str(runtime.device) if runtime is not None else "unavailable",
+        "architecture": runtime.architecture if runtime is not None else None,
+        "image_size": runtime.image_size if runtime is not None else None,
         "num_classes": len(runtime.idx_to_class) if runtime is not None else 0,
     }
+
+
+@app.post("/tts")
+async def text_to_speech(payload: TTSRequest, request: Request) -> Response:
+    text = payload.text.strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="Text must not be empty.")
+
+    service: GeminiTTSService | None = getattr(request.app.state, "tts_service", None)
+    if service is None:
+        raise HTTPException(status_code=503, detail="Text-to-speech service is unavailable.")
+
+    try:
+        audio = await run_in_threadpool(service.generate_wav, text)
+    except GeminiTTSNotConfiguredError as error:
+        raise HTTPException(
+            status_code=503,
+            detail="Gemini TTS is not configured. Set GEMINI_API_KEY in the backend .env file.",
+        ) from error
+    except GeminiTTSTimeoutError as error:
+        raise HTTPException(status_code=504, detail="Gemini TTS request timed out.") from error
+    except GeminiTTSAuthenticationError as error:
+        LOGGER.warning("Gemini rejected the configured TTS API key.")
+        raise HTTPException(
+            status_code=502,
+            detail=str(error),
+        ) from error
+    except GeminiTTSQuotaError as error:
+        LOGGER.warning("Gemini TTS quota or rate limit was reached.")
+        raise HTTPException(
+            status_code=429,
+            detail=str(error),
+        ) from error
+    except GeminiTTSUnavailableError as error:
+        LOGGER.warning("Gemini TTS service is unavailable.")
+        raise HTTPException(
+            status_code=503,
+            detail=str(error),
+        ) from error
+    except GeminiTTSGenerationError as error:
+        LOGGER.warning("Gemini TTS generation failed: %s", error)
+        raise HTTPException(status_code=502, detail=str(error)) from error
+
+    return Response(
+        content=audio,
+        media_type="audio/wav",
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Disposition": 'inline; filename="signsense-speech.wav"',
+        },
+    )
 
 
 @app.websocket("/ws/predict")

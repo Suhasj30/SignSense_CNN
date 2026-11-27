@@ -1,10 +1,8 @@
+import { backendWebSocketUrl } from './backendConfig'
+import { getCenterCropRect } from './frameCrop'
 import type { Prediction } from '../types'
 
 export type PredictionListener = (prediction: Prediction) => void
-
-export interface RecognitionService {
-  start(onPrediction: PredictionListener, intervalMs?: number): () => void
-}
 
 export class WebSocketRecognitionService {
   start(
@@ -12,19 +10,17 @@ export class WebSocketRecognitionService {
     stream: MediaStream,
     intervalMs = 250,
   ): () => void {
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const backendUrl = `${protocol}//${window.location.hostname}:8000/ws/predict`
-    const socket = new WebSocket(backendUrl)
+    const backendUrl = backendWebSocketUrl('ws/predict')
     const video = document.createElement('video')
     const canvas = document.createElement('canvas')
     const context = canvas.getContext('2d')
     const videoTrack = stream.getVideoTracks()[0]
     let active = true
     let pending = false
-    let reportedError = false
-    let framesSent = 0
-    let predictionsReceived = 0
+    let reconnectAttempts = 0
+    let socket: WebSocket | null = null
     let interval: number | undefined
+    let reconnectTimer: number | undefined
     let responseTimeout: number | undefined
 
     console.info(`[SignSense CNN] Connecting to ${backendUrl}`)
@@ -34,181 +30,241 @@ export class WebSocketRecognitionService {
     video.playsInline = true
     video.srcObject = stream
 
-    const reportError = (message: string) => {
-      if (!active || reportedError) return
-      reportedError = true
+    const clearResponseTimeout = () => {
+      if (responseTimeout !== undefined) {
+        window.clearTimeout(responseTimeout)
+        responseTimeout = undefined
+      }
+    }
+
+    const emitStatus = (status: 'detecting' | 'error', message: string) => {
       onPrediction({
         className: '',
         confidence: 0,
         timestamp: Date.now(),
-        status: 'error',
+        status,
         source: 'cnn',
         message,
       })
-      console.error(`[SignSense CNN] ${message}`)
-      if (interval !== undefined) window.clearInterval(interval)
-      if (responseTimeout !== undefined) window.clearTimeout(responseTimeout)
-      pending = false
-      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
-        socket.close()
-      }
     }
 
-    const stop = () => {
+    const reportFatalError = (message: string) => {
+      if (!active) return
       active = false
       if (interval !== undefined) window.clearInterval(interval)
-      if (responseTimeout !== undefined) window.clearTimeout(responseTimeout)
+      if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer)
+      clearResponseTimeout()
       videoTrack?.removeEventListener('ended', onTrackEnded)
       video.pause()
       video.srcObject = null
-      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
-        socket.close()
+      const currentSocket = socket
+      socket = null
+      if (
+        currentSocket &&
+        (currentSocket.readyState === WebSocket.OPEN ||
+          currentSocket.readyState === WebSocket.CONNECTING)
+      ) {
+        currentSocket.close()
       }
+      emitStatus('error', message)
+      console.error(`[SignSense CNN] ${message}`)
     }
 
-    const onTrackEnded = () => reportError('The camera stream ended. Restart the camera and recognition.')
-    videoTrack?.addEventListener('ended', onTrackEnded)
-
-    socket.addEventListener('open', () => {
-      console.info('[SignSense CNN] WebSocket connected; waiting for camera frames')
-      void video.play().then(() => {
-        if (!active) return
-        interval = window.setInterval(() => {
-          if (
-            !active ||
-            pending ||
-            socket.readyState !== WebSocket.OPEN ||
-            video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
-            video.videoWidth === 0 ||
-            video.videoHeight === 0
-          ) {
-            return
-          }
-          if (!context) {
-            reportError('Could not prepare the camera frame for inference.')
-            return
-          }
-          try {
-            context.drawImage(video, 0, 0, canvas.width, canvas.height)
-          } catch {
-            reportError('Could not capture a frame from the camera stream.')
-            return
-          }
-          pending = true
-          canvas.toBlob((blob) => {
-            if (!active) {
-              pending = false
-              return
-            }
-            if (!blob) {
-              pending = false
-              reportError('Could not encode a camera frame.')
-              return
-            }
-            try {
-              socket.send(blob)
-              framesSent += 1
-              if (framesSent === 1 || framesSent % 20 === 0) {
-                console.info(
-                  `[SignSense CNN] Sent JPEG frame ${framesSent} (${blob.size} bytes)`,
-                )
-              }
-              responseTimeout = window.setTimeout(() => {
-                pending = false
-                reportError('The inference backend did not respond in time.')
-                socket.close()
-              }, 10_000)
-            } catch {
-              pending = false
-              reportError('Could not send a frame to the inference backend.')
-            }
-          }, 'image/jpeg', 0.65)
-        }, intervalMs)
-      }).catch(() => {
-        reportError('Could not read frames from the camera stream.')
-      })
-    })
-
-    socket.addEventListener('message', (event: MessageEvent<string>) => {
+    const scheduleReconnect = (message: string) => {
+      if (!active || reconnectTimer !== undefined) return
       pending = false
-      if (responseTimeout !== undefined) window.clearTimeout(responseTimeout)
-      try {
-        const result: unknown = JSON.parse(event.data)
-        if (!result || typeof result !== 'object') throw new Error('Invalid response')
-        const response = result as { class?: unknown; confidence?: unknown; error?: unknown }
-        if (typeof response.error === 'string') {
-          reportError(response.error)
-          return
-        }
-        if (
-          typeof response.class !== 'string' ||
-          !/^(?:[A-Z]|[0-9])$/.test(response.class) ||
-          typeof response.confidence !== 'number' ||
-          !Number.isFinite(response.confidence) ||
-          response.confidence < 0 ||
-          response.confidence > 1
-        ) {
-          throw new Error('Invalid prediction response')
-        }
-        reportedError = false
-        predictionsReceived += 1
-        if (predictionsReceived === 1 || predictionsReceived % 20 === 0) {
-          console.info(
-            `[SignSense CNN] Received prediction ${predictionsReceived}: ${response.class} (${Math.round(response.confidence * 100)}%)`,
-          )
-        }
-        onPrediction({
-          className: response.class,
-          confidence: response.confidence,
-          timestamp: Date.now(),
-          status: 'recognized',
-          source: 'cnn',
-        })
-      } catch {
-        reportError('Received an invalid response from the inference backend.')
+      clearResponseTimeout()
+      const delay = Math.min(500 * 2 ** reconnectAttempts, 8000)
+      reconnectAttempts += 1
+      emitStatus('detecting', `${message} Retrying in ${(delay / 1000).toFixed(1)} seconds.`)
+      console.warn(`[SignSense CNN] ${message}; retrying in ${delay} ms`)
+
+      const currentSocket = socket
+      socket = null
+      if (
+        currentSocket &&
+        (currentSocket.readyState === WebSocket.OPEN ||
+          currentSocket.readyState === WebSocket.CONNECTING)
+      ) {
+        currentSocket.close()
       }
-    })
 
-    socket.addEventListener('error', () => {
-      reportError(`Could not connect to the inference backend at ${backendUrl}.`)
-    })
-    socket.addEventListener('close', () => {
-      if (active) reportError('The inference backend connection closed.')
-    })
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = undefined
+        if (!active) return
+        emitStatus('detecting', 'Reconnecting to the CNN backend.')
+        connect()
+      }, delay)
+    }
 
-    return stop
-  }
-}
-
-export class MockRecognitionService implements RecognitionService {
-  private readonly classes = ['H', 'E', 'L', 'O', 'W', 'R', 'D', 'A', 'S', 'I', 'N', 'G']
-  private cursor = 0
-
-  start(onPrediction: PredictionListener, intervalMs = 1800): () => void {
-    const timer = window.setInterval(() => {
-      if (this.cursor > 0 && this.cursor % 5 === 0) {
-        onPrediction({
-          className: '',
-          confidence: 0,
-          timestamp: Date.now(),
-          status: 'no_sign',
-          source: 'mock',
-        })
-        this.cursor += 1
+    const captureFrame = () => {
+      const currentSocket = socket
+      if (
+        !active ||
+        pending ||
+        !currentSocket ||
+        currentSocket.readyState !== WebSocket.OPEN ||
+        video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
+        video.videoWidth === 0 ||
+        video.videoHeight === 0
+      ) {
+        return
+      }
+      if (!context) {
+        reportFatalError('Could not prepare the camera frame for inference.')
         return
       }
 
-      const className = this.classes[this.cursor % this.classes.length]
-      this.cursor += 1
-      onPrediction({
-        className,
-        confidence: 0.79 + Math.random() * 0.2,
-        timestamp: Date.now(),
-        status: 'recognized',
-        source: 'mock',
+      try {
+        const crop = getCenterCropRect(video.videoWidth, video.videoHeight)
+        context.drawImage(
+          video,
+          crop.sx,
+          crop.sy,
+          crop.width,
+          crop.height,
+          0,
+          0,
+          canvas.width,
+          canvas.height,
+        )
+      } catch {
+        reportFatalError('Could not capture a frame from the camera stream.')
+        return
+      }
+
+      pending = true
+      canvas.toBlob((blob) => {
+        if (!active) return
+        if (!blob) {
+          pending = false
+          reportFatalError('Could not encode a camera frame.')
+          return
+        }
+        if (socket !== currentSocket || currentSocket.readyState !== WebSocket.OPEN) {
+          pending = false
+          return
+        }
+        try {
+          currentSocket.send(blob)
+          if (currentSocket.bufferedAmount > 4 * 1024 * 1024) {
+            scheduleReconnect('The inference connection is congested.')
+            return
+          }
+          responseTimeout = window.setTimeout(() => {
+            pending = false
+            scheduleReconnect('The inference backend did not respond in time.')
+          }, 10_000)
+        } catch {
+          pending = false
+          scheduleReconnect('Could not send a frame to the inference backend.')
+        }
+      }, 'image/jpeg', 0.65)
+    }
+
+    const connect = () => {
+      if (!active) return
+      let connection: WebSocket
+      try {
+        connection = new WebSocket(backendUrl)
+      } catch {
+        scheduleReconnect(`Could not connect to the inference backend at ${backendUrl}.`)
+        return
+      }
+      socket = connection
+
+      connection.addEventListener('open', () => {
+        if (!active || socket !== connection) {
+          connection.close()
+          return
+        }
+        reconnectAttempts = 0
+        emitStatus('detecting', 'Connected to the CNN backend. Waiting for a sign.')
+        console.info('[SignSense CNN] WebSocket connected')
+        void video.play().then(() => {
+          if (active && interval === undefined) {
+            interval = window.setInterval(captureFrame, intervalMs)
+          }
+        }).catch(() => {
+          reportFatalError('Could not read frames from the camera stream.')
+        })
       })
-    }, intervalMs)
-    return () => window.clearInterval(timer)
+
+      connection.addEventListener('message', (event: MessageEvent<string>) => {
+        if (!active || socket !== connection) return
+        pending = false
+        clearResponseTimeout()
+        try {
+          const result: unknown = JSON.parse(event.data)
+          if (!result || typeof result !== 'object') throw new Error('Invalid response')
+          const response = result as {
+            class?: unknown
+            confidence?: unknown
+            error?: unknown
+          }
+          if (typeof response.error === 'string') {
+            scheduleReconnect(response.error)
+            return
+          }
+          if (
+            typeof response.class !== 'string' ||
+            !/^(?:[A-Z]|[0-9])$/.test(response.class) ||
+            typeof response.confidence !== 'number' ||
+            !Number.isFinite(response.confidence) ||
+            response.confidence < 0 ||
+            response.confidence > 1
+          ) {
+            throw new Error('Invalid prediction response')
+          }
+          onPrediction({
+            className: response.class,
+            confidence: response.confidence,
+            timestamp: Date.now(),
+            status: 'recognized',
+            source: 'cnn',
+          })
+        } catch {
+          scheduleReconnect('Received an invalid response from the inference backend.')
+        }
+      })
+
+      connection.addEventListener('error', () => {
+        scheduleReconnect(`Could not connect to the inference backend at ${backendUrl}.`)
+      })
+      connection.addEventListener('close', () => {
+        scheduleReconnect('The inference backend connection closed.')
+      })
+    }
+
+    const onTrackEnded = () => {
+      reportFatalError('The camera stream ended. Restart the camera and recognition.')
+    }
+    videoTrack?.addEventListener('ended', onTrackEnded)
+    if (!videoTrack) {
+      reportFatalError('The camera stream has no video track.')
+    } else {
+      emitStatus('detecting', 'Connecting to the CNN backend.')
+      connect()
+    }
+
+    return () => {
+      active = false
+      if (interval !== undefined) window.clearInterval(interval)
+      if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer)
+      clearResponseTimeout()
+      videoTrack?.removeEventListener('ended', onTrackEnded)
+      video.pause()
+      video.srcObject = null
+      const currentSocket = socket
+      socket = null
+      if (
+        currentSocket &&
+        (currentSocket.readyState === WebSocket.OPEN ||
+          currentSocket.readyState === WebSocket.CONNECTING)
+      ) {
+        currentSocket.close()
+      }
+    }
   }
 }
 

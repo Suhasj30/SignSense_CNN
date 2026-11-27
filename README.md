@@ -68,7 +68,22 @@ Since P10 is excluded from training and validation, test metrics estimate genera
 
 ## Real-time backend and frontend
 
-The backend loads the trained MobileNetV3Small checkpoint once at startup and serves CPU predictions over a WebSocket. The browser sends resized 224x224 JPEG frames at most four times per second while a prediction is in flight. Webcam frames are processed by the local backend and are not written to disk.
+The backend loads the trained MobileNetV3Small checkpoint once at startup and serves predictions over a WebSocket, using CUDA when available or CPU otherwise. The browser sends resized 224x224 JPEG frames at most four times per second while a prediction is in flight. Webcam frames are processed by the local backend and are not written to disk. The checkpoint contains 36 classes (A–Z and 0–9); SPACE and delete are sentence-builder controls, not model classes.
+
+Gemini TTS is served separately over `POST /tts`; it returns WAV audio and does not reload or run the CNN for speech requests. The default model is `gemini-3.8-flash-lite-tts` with the `Kore` voice. The backend automatically reads the API key from the repository-root `.env` file, which is ignored by Git:
+
+```bash
+cd ~/Desktop/SignSense_CNN
+cp -n .env.example .env
+# Edit .env and replace this example line with an active Google AI Studio API key:
+# GEMINI_API_KEY=YOUR_VALID_GOOGLE_AI_STUDIO_API_KEY
+source ~/Desktop/ASL/.venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+If Gemini reports `API_KEY_INVALID`, the key is present but Google rejects it; replace the value on that line with a valid key from Google AI Studio. Do not put the key in frontend files or share it in chat.
+
+`GEMINI_TTS_MODEL`, `GEMINI_TTS_VOICE`, `GEMINI_TTS_TIMEOUT_SECONDS`, and `SIGNSENSE_DEVICE` can be set in `.env`. `SIGNSENSE_DEVICE` accepts `auto` (default), `cuda`, or `cpu`. The API key is only read by the backend and is never sent to the frontend. Auto-speak is off by default; when enabled, it speaks after **Add word** or when sentence-ending punctuation is entered. CNN predictions do not trigger speech per frame. Use **Speak sentence** to speak the current text manually.
 
 Use the existing environment referenced above; these commands do not change the separate `~/Desktop/ASL` project:
 
@@ -80,16 +95,28 @@ cd ~/Desktop/SignSense_CNN
 python -m uvicorn backend.app:app --host 127.0.0.1 --port 8000
 ```
 
-The selected checkpoint is `models/checkpoints/mobilenet_v3_small_best_20261126_100259.pth`. Check readiness at [http://127.0.0.1:8000/health](http://127.0.0.1:8000/health). `SIGNSENSE_CHECKPOINT` can override the checkpoint path, `SIGNSENSE_CORS_ORIGINS` can set comma-separated allowed browser origins, and `SIGNSENSE_TORCH_THREADS` can set the CPU thread count.
+The selected checkpoint is `models/checkpoints/mobilenet_v3_small_best_20261126_100259.pth`. Check readiness and the selected inference device at [http://127.0.0.1:8000/health](http://127.0.0.1:8000/health). `SIGNSENSE_CHECKPOINT` can override the checkpoint path, `SIGNSENSE_CORS_ORIGINS` can set comma-separated allowed browser origins, and `SIGNSENSE_TORCH_THREADS` can set the CPU thread count.
+
+To test Gemini TTS directly after the backend starts:
+
+```bash
+curl --fail -X POST http://127.0.0.1:8000/tts \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Hello, welcome to SignSense."}' \
+  --output /tmp/signsense-speech.wav
+```
+
+The endpoint returns `audio/wav`; missing keys return `503`, empty text returns `422`, invalid Google keys return `502`, quota limits return `429`, network/unavailable errors return `503`, and request timeouts return `504`.
 
 Terminal 2 — frontend:
 
 ```bash
 cd ~/Desktop/SignSense_CNN/frontend
+cp -n .env.example .env
 npm run dev
 ```
 
-Open [http://localhost:5173](http://localhost:5173), allow camera access when prompted, click **Start camera**, select **Real camera** under Recognition mode, then click **Start recognition**. CNN mode only sends frames after all three steps. **Demo mode** and its manual character controls remain available without the backend. The browser console logs WebSocket connection, JPEG frame-send, and prediction milestones; backend logs include checkpoint status and a prediction for the first and every twentieth processed frame. The WebSocket endpoint is `ws://127.0.0.1:8000/ws/predict`.
+`frontend/.env.example` configures `VITE_BACKEND_URL`; change it in the local `frontend/.env` when the backend is hosted elsewhere. Open [http://localhost:5173](http://localhost:5173), allow camera access, click **Start camera**, then **Start recognition**. The header reports backend/model status. Camera frames are only sent while live recognition is running, and the WebSocket client reconnects after transient backend interruptions. The browser console logs connection, frame-send, and prediction milestones; backend logs include checkpoint/device status and periodic predictions.
 
 ## Webcam and image prediction
 

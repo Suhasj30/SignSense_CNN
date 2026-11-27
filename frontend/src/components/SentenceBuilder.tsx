@@ -4,50 +4,43 @@ import {
   Check,
   Clipboard,
   Eraser,
-  Pause,
   Play,
   Plus,
   RotateCcw,
   Square,
   Volume2,
 } from 'lucide-react'
-import type { SpeechStatus, VoiceOption } from '../hooks/useSpeech'
+import type { SpeechStatus } from '../hooks/useSpeech'
 import type { AppSettings } from '../types'
 
 interface SentenceBuilderProps {
   sentence: string
   onSentenceChange: (value: string) => void
   settings: AppSettings
-  voices: VoiceOption[]
   speechStatus: SpeechStatus
   speechError: string
-  speechAvailable: boolean
+  needsUserPlay: boolean
   onSettingsChange: (settings: AppSettings) => void
-  onSpeak: (text: string) => void
+  onSpeak: (text: string) => Promise<boolean>
+  onPlay: () => Promise<boolean>
   onStop: () => void
-  onPause: () => void
-  onResume: () => void
 }
 
 export function SentenceBuilder({
   sentence,
   onSentenceChange,
   settings,
-  voices,
   speechStatus,
   speechError,
-  speechAvailable,
+  needsUserPlay,
   onSettingsChange,
   onSpeak,
+  onPlay,
   onStop,
-  onPause,
-  onResume,
 }: SentenceBuilderProps) {
   const [word, setWord] = useState('')
   const [copied, setCopied] = useState(false)
   const hasText = sentence.trim().length > 0
-  const selectedVoice = voices.some((voice) => voice.voiceURI === settings.voiceURI)
-
   function addWord(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     const cleanWord = word.trim()
@@ -55,7 +48,7 @@ export function SentenceBuilder({
     const next = `${sentence.trimEnd()}${sentence.trim() ? ' ' : ''}${cleanWord}`
     onSentenceChange(next)
     setWord('')
-    if (settings.autoSpeak) onSpeak(next)
+    if (settings.autoSpeak && !/[.!?]["')\]]*\s*$/.test(next.trim())) void onSpeak(next)
   }
 
   function addSpace() {
@@ -80,18 +73,14 @@ export function SentenceBuilder({
     }
   }
 
-  const speechLabel =
-    speechStatus === 'speaking'
-      ? 'Speaking'
-      : speechStatus === 'paused'
-        ? 'Paused'
-        : speechStatus === 'stopped'
-          ? 'Stopped'
-          : speechStatus === 'error'
-            ? 'Speech error'
-            : speechStatus === 'unsupported'
-              ? 'Unavailable'
-              : 'Ready'
+  const speechLabels: Record<SpeechStatus, string> = {
+    ready: 'Ready',
+    loading: 'Generating audio',
+    speaking: 'Speaking',
+    stopped: 'Stopped',
+    error: 'Speech error',
+  }
+  const speechLabel = speechLabels[speechStatus]
 
   return (
     <section className="card sentence-card">
@@ -152,7 +141,7 @@ export function SentenceBuilder({
           <input
             type="checkbox"
             checked={settings.autoSpeak}
-            disabled={!settings.speechEnabled || !speechAvailable}
+            disabled={!settings.speechEnabled}
             onChange={(event) => onSettingsChange({ ...settings, autoSpeak: event.target.checked })}
           />
           <i />
@@ -163,72 +152,30 @@ export function SentenceBuilder({
         <div className="speech-actions">
           <button
             className="button button-primary speak-button"
-            disabled={!hasText || !settings.speechEnabled || !speechAvailable}
-            onClick={() => onSpeak(sentence)}
+            disabled={!hasText || !settings.speechEnabled || speechStatus === 'loading'}
+            onClick={() => void onSpeak(sentence)}
           >
-            <Volume2 size={16} /> {speechStatus === 'speaking' ? 'Speak again' : 'Speak sentence'}
+            <Volume2 size={16} /> {speechStatus === 'loading' ? 'Generating…' : speechStatus === 'speaking' ? 'Speak again' : 'Speak sentence'}
           </button>
-          {speechStatus === 'paused' ? (
-            <button className="button button-outline stop-button" disabled={!settings.speechEnabled} onClick={onResume}>
-              <Play size={14} fill="currentColor" /> Resume
+          {needsUserPlay && (
+            <button className="button button-outline stop-button" onClick={() => void onPlay()}>
+              <Play size={14} fill="currentColor" /> Play audio
             </button>
-          ) : speechStatus === 'speaking' ? (
-            <button className="button button-outline stop-button" disabled={!settings.speechEnabled} onClick={onPause}>
-              <Pause size={14} fill="currentColor" /> Pause
-            </button>
-          ) : null}
-          <button className="button button-outline stop-button" disabled={!settings.speechEnabled || !speechAvailable || !['speaking', 'paused'].includes(speechStatus)} onClick={onStop}>
+          )}
+          <button
+            className="button button-outline stop-button"
+            disabled={!['loading', 'speaking'].includes(speechStatus) && !needsUserPlay}
+            onClick={onStop}
+          >
             <Square size={14} fill="currentColor" /> Stop
           </button>
           <button className="icon-button copy-button" disabled={!hasText} onClick={() => void copyText()} aria-label="Copy sentence" title="Copy sentence">
             {copied ? <Check size={16} /> : <Clipboard size={16} />}
           </button>
         </div>
-        <label className="voice-select">
-          <span>Voice</span>
-          <select
-            value={selectedVoice ? settings.voiceURI : ''}
-            disabled={!settings.speechEnabled || !speechAvailable}
-            onChange={(event) => onSettingsChange({ ...settings, voiceURI: event.target.value })}
-          >
-            <option value="">Default English voice</option>
-            {voices.map((voice) => (
-              <option value={voice.voiceURI} key={voice.voiceURI}>
-                {voice.name} ({voice.lang}){voice.isDefault ? ' · default' : ''}
-              </option>
-            ))}
-          </select>
-        </label>
       </div>
-
-      <div className="speech-adjustments">
-        <label className="range-control">
-          <span>Speed <strong>{settings.speechRate.toFixed(1)}×</strong></span>
-          <input
-            type="range"
-            min="0.6"
-            max="1.5"
-            step="0.1"
-            value={settings.speechRate}
-            disabled={!settings.speechEnabled}
-            onChange={(event) => onSettingsChange({ ...settings, speechRate: Number(event.target.value) })}
-          />
-        </label>
-        <label className="range-control">
-          <span>Pitch <strong>{settings.speechPitch.toFixed(1)}</strong></span>
-          <input
-            type="range"
-            min="0.5"
-            max="1.5"
-            step="0.1"
-            value={settings.speechPitch}
-            disabled={!settings.speechEnabled}
-            onChange={(event) => onSettingsChange({ ...settings, speechPitch: Number(event.target.value) })}
-          />
-        </label>
-      </div>
-      {!speechAvailable && <p className="inline-warning">This browser does not support speech synthesis. Try an up-to-date desktop browser.</p>}
       {speechError && speechStatus === 'error' && <p className="inline-error">{speechError}</p>}
+      {speechError && speechStatus !== 'error' && <p className="inline-warning">{speechError}</p>}
     </section>
   )
 }

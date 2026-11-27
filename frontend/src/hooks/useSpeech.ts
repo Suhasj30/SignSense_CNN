@@ -1,127 +1,164 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { backendHttpUrl } from '../services/backendConfig'
 
-export interface VoiceOption {
-  voiceURI: string
-  name: string
-  lang: string
-  isDefault: boolean
+export type SpeechStatus = 'ready' | 'loading' | 'speaking' | 'stopped' | 'error'
+
+function prepareSpeechText(text: string): string {
+  const cleanText = text.trim().replace(/\s+/g, ' ')
+  if (!cleanText) return ''
+
+  const sentenceText =
+    cleanText === cleanText.toLocaleUpperCase()
+      ? cleanText.toLocaleLowerCase().replace(/^[a-z]/, (letter) => letter.toLocaleUpperCase())
+      : cleanText
+  return /[.!?]["')\]]*$/.test(sentenceText) ? sentenceText : `${sentenceText}.`
 }
 
-export type SpeechStatus = 'ready' | 'speaking' | 'paused' | 'stopped' | 'error' | 'unsupported'
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : 'An unexpected audio error occurred.'
+}
 
 export function useSpeech() {
-  const [voices, setVoices] = useState<VoiceOption[]>([])
-  const [status, setStatus] = useState<SpeechStatus>(() =>
-    typeof window !== 'undefined' && 'speechSynthesis' in window ? 'ready' : 'unsupported',
-  )
+  const [status, setStatus] = useState<SpeechStatus>('ready')
   const [error, setError] = useState('')
-  const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null)
-  const speechAvailable = typeof window !== 'undefined' && 'speechSynthesis' in window
+  const [needsUserPlay, setNeedsUserPlay] = useState(false)
+  const audioRef = useRef<HTMLAudioElement | null>(null)
+  const objectUrlRef = useRef<string | null>(null)
+  const controllerRef = useRef<AbortController | null>(null)
+  const requestIdRef = useRef(0)
 
-  const refreshVoices = useCallback(() => {
-    if (!speechAvailable) return
-    setVoices(
-      window.speechSynthesis
-        .getVoices()
-        .map((voice) => ({
-          voiceURI: voice.voiceURI,
-          name: voice.name,
-          lang: voice.lang,
-          isDefault: voice.default,
-        }))
-        .sort((left, right) => left.name.localeCompare(right.name)),
-    )
-  }, [speechAvailable])
-
-  useEffect(() => {
-    if (!speechAvailable) return
-    refreshVoices()
-    window.speechSynthesis.addEventListener('voiceschanged', refreshVoices)
-    return () => {
-      window.speechSynthesis.removeEventListener('voiceschanged', refreshVoices)
-      window.speechSynthesis.cancel()
+  const releaseAudio = useCallback(() => {
+    const audio = audioRef.current
+    if (audio) {
+      audio.pause()
+      audio.removeAttribute('src')
+      audio.load()
     }
-  }, [refreshVoices, speechAvailable])
+    audioRef.current = null
+    if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current)
+    objectUrlRef.current = null
+  }, [])
 
-  const speak = useCallback(
-    (text: string, options: { voiceURI: string; rate: number; pitch: number }) => {
-      const cleanText = text.trim()
-      if (!speechAvailable) {
-        setStatus('unsupported')
-        setError('Text-to-speech is not supported by this browser.')
+  useEffect(
+    () => () => {
+      requestIdRef.current += 1
+      controllerRef.current?.abort()
+      releaseAudio()
+    },
+    [releaseAudio],
+  )
+
+  const play = useCallback(async () => {
+    const audio = audioRef.current
+    if (!audio) return false
+    const requestId = requestIdRef.current
+    try {
+      await audio.play()
+      if (requestId !== requestIdRef.current) return false
+      setNeedsUserPlay(false)
+      setError('')
+      setStatus('speaking')
+      return true
+    } catch (playError) {
+      if (requestId !== requestIdRef.current) return false
+      if (playError instanceof DOMException && playError.name === 'NotAllowedError') {
+        setNeedsUserPlay(true)
+        setError('Your browser blocked automatic playback. Select Play audio to start it.')
+        setStatus('ready')
         return false
       }
-      if (!cleanText) return false
+      setError(`Audio playback failed: ${errorMessage(playError)}`)
+      setStatus('error')
+      return false
+    }
+  }, [])
 
-      const synthesis = window.speechSynthesis
-      synthesis.cancel()
-      const utterance = new SpeechSynthesisUtterance(cleanText)
-      utterance.lang = 'en-US'
-      utterance.rate = options.rate
-      utterance.pitch = options.pitch
-      const selectedVoice = voices.find((voice) => voice.voiceURI === options.voiceURI)
-      if (selectedVoice) {
-        const systemVoice = synthesis.getVoices().find((voice) => voice.voiceURI === selectedVoice.voiceURI)
-        if (systemVoice) utterance.voice = systemVoice
-        utterance.lang = selectedVoice.lang || 'en-US'
-      }
-
-      utterance.onstart = () => {
-        if (utteranceRef.current === utterance) {
-          setStatus('speaking')
-          setError('')
-        }
-      }
-      utterance.onpause = () => {
-        if (utteranceRef.current === utterance) setStatus('paused')
-      }
-      utterance.onresume = () => {
-        if (utteranceRef.current === utterance) setStatus('speaking')
-      }
-      utterance.onend = () => {
-        if (utteranceRef.current === utterance) {
-          utteranceRef.current = null
-          setStatus('ready')
-        }
-      }
-      utterance.onerror = (event) => {
-        if (utteranceRef.current !== utterance) return
-        utteranceRef.current = null
-        if (event.error === 'canceled' || event.error === 'interrupted') {
-          setStatus('stopped')
-          return
-        }
+  const speak = useCallback(
+    async (text: string) => {
+      const preparedText = prepareSpeechText(text)
+      if (!preparedText) {
+        setError('Enter some text before requesting speech.')
         setStatus('error')
-        setError(`Speech playback failed: ${event.error}.`)
+        return false
       }
 
-      utteranceRef.current = utterance
-      setStatus('ready')
-      synthesis.speak(utterance)
-      return true
+      controllerRef.current?.abort()
+      releaseAudio()
+      const requestId = ++requestIdRef.current
+      const controller = new AbortController()
+      controllerRef.current = controller
+      setNeedsUserPlay(false)
+      setError('')
+      setStatus('loading')
+
+      try {
+        const response = await fetch(backendHttpUrl('tts'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: preparedText }),
+          signal: controller.signal,
+        })
+        if (!response.ok) {
+          const responseBody: unknown = await response.json().catch(() => null)
+          const detail =
+            responseBody &&
+            typeof responseBody === 'object' &&
+            'detail' in responseBody &&
+            typeof responseBody.detail === 'string'
+              ? responseBody.detail
+              : `Gemini TTS request failed (${response.status}).`
+          throw new Error(detail)
+        }
+
+        const audioBlob = await response.blob()
+        if (!audioBlob.size || !audioBlob.type.includes('audio/wav')) {
+          throw new Error('The TTS backend returned an invalid audio response.')
+        }
+        if (requestId !== requestIdRef.current) return false
+
+        const objectUrl = URL.createObjectURL(audioBlob)
+        objectUrlRef.current = objectUrl
+        const audio = new Audio(objectUrl)
+        audio.preload = 'auto'
+        audio.onplay = () => {
+          if (requestId === requestIdRef.current) {
+            setNeedsUserPlay(false)
+            setError('')
+            setStatus('speaking')
+          }
+        }
+        audio.onended = () => {
+          if (requestId === requestIdRef.current) setStatus('ready')
+        }
+        audio.onerror = () => {
+          if (requestId === requestIdRef.current) {
+            setError('The generated audio could not be played.')
+            setStatus('error')
+          }
+        }
+        audioRef.current = audio
+        await play()
+        return true
+      } catch (requestError) {
+        if (controller.signal.aborted || requestId !== requestIdRef.current) return false
+        setNeedsUserPlay(false)
+        setError(`Speech request failed: ${errorMessage(requestError)}`)
+        setStatus('error')
+        return false
+      }
     },
-    [speechAvailable, voices],
+    [play, releaseAudio],
   )
 
   const stop = useCallback(() => {
-    if (!speechAvailable) return
-    window.speechSynthesis.cancel()
-    utteranceRef.current = null
-    setStatus('stopped')
+    requestIdRef.current += 1
+    controllerRef.current?.abort()
+    controllerRef.current = null
+    releaseAudio()
+    setNeedsUserPlay(false)
     setError('')
-  }, [speechAvailable])
+    setStatus('stopped')
+  }, [releaseAudio])
 
-  const pause = useCallback(() => {
-    if (!speechAvailable || !window.speechSynthesis.speaking) return
-    window.speechSynthesis.pause()
-    setStatus('paused')
-  }, [speechAvailable])
-
-  const resume = useCallback(() => {
-    if (!speechAvailable || !window.speechSynthesis.paused) return
-    window.speechSynthesis.resume()
-    setStatus('speaking')
-  }, [speechAvailable])
-
-  return { voices, status, error, speechAvailable, speak, stop, pause, resume }
+  return { status, error, needsUserPlay, speak, play, stop }
 }

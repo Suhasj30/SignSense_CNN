@@ -7,7 +7,7 @@ export interface Prediction {
   confidence: number
   timestamp: number
   status: RecognitionStatus
-  source: 'mock' | 'cnn'
+  source: 'cnn'
   message?: string
 }
 
@@ -20,9 +20,6 @@ export interface HistoryEntry {
 export interface AppSettings {
   speechEnabled: boolean
   autoSpeak: boolean
-  voiceURI: string
-  speechRate: number
-  speechPitch: number
   confidenceThreshold: number
   recognitionCooldownMs: number
   cameraDeviceId: string

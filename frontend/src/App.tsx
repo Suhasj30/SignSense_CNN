@@ -7,11 +7,11 @@ import { PredictionCard } from './components/PredictionCard'
 import { SentenceBuilder } from './components/SentenceBuilder'
 import { SettingsPage } from './components/SettingsPage'
 import { Sidebar } from './components/Sidebar'
+import { useBackendHealth } from './hooks/useBackendHealth'
 import { useCamera } from './hooks/useCamera'
 import { useSpeech } from './hooks/useSpeech'
 import { addHistoryEntry, clearHistory, deleteHistoryEntry, loadHistory } from './services/historyService'
 import {
-  MockRecognitionService,
   PredictionProcessor,
   WebSocketRecognitionService,
 } from './services/recognitionService'
@@ -26,13 +26,14 @@ export default function App() {
   const [prediction, setPrediction] = useState<Prediction | null>(null)
   const [recentPredictions, setRecentPredictions] = useState<Prediction[]>([])
   const [recognitionRunning, setRecognitionRunning] = useState(false)
-  const [recognitionMode, setRecognitionMode] = useState<'demo' | 'camera'>('demo')
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
+  const backendHealth = useBackendHealth()
   const speech = useSpeech()
   const camera = useCamera(settings.cameraDeviceId)
   const processor = useRef(new PredictionProcessor())
   const cnnPredictionCount = useRef(0)
+  const lastAutoSpokenText = useRef('')
 
   useEffect(() => saveSettings(settings), [settings])
 
@@ -41,23 +42,28 @@ export default function App() {
     setSettings(next)
   }, [speech.stop])
 
-  const speakText = useCallback((text: string) => {
-    if (!settings.speechEnabled) return
-    const started = speech.speak(text, {
-      voiceURI: settings.voiceURI,
-      rate: settings.speechRate,
-      pitch: settings.speechPitch,
-    })
-    if (started) setHistory(addHistoryEntry(text))
-  }, [settings, speech])
+  const speakText = useCallback(async (text: string) => {
+    if (!settings.speechEnabled) return false
+    const generated = await speech.speak(text)
+    if (generated) setHistory(addHistoryEntry(text))
+    return generated
+  }, [settings.speechEnabled, speech.speak])
 
   const updateSentence = useCallback((next: string) => {
     setSentence(next)
-    if (speech.status === 'speaking' || speech.status === 'paused') speech.stop()
-    if (settings.autoSpeak && /[.!?]["')\]]*\s*$/.test(next) && next.trim() !== sentence.trim()) {
-      speakText(next)
+    if (speech.status === 'speaking' || speech.status === 'loading') speech.stop()
+    const completedSentence = /[.!?]["')\]]*\s*$/.test(next.trim())
+    const previousSentenceWasComplete = /[.!?]["')\]]*\s*$/.test(sentence.trim())
+    if (
+      settings.autoSpeak &&
+      completedSentence &&
+      !previousSentenceWasComplete &&
+      next.trim() !== lastAutoSpokenText.current
+    ) {
+      lastAutoSpokenText.current = next.trim()
+      void speakText(next)
     }
-  }, [sentence, settings.autoSpeak, speech, speakText])
+  }, [sentence, settings.autoSpeak, speech.status, speech.stop, speakText])
 
   const processPrediction = useCallback((nextPrediction: Prediction) => {
     if (nextPrediction.source === 'cnn' && nextPrediction.status === 'recognized') {
@@ -68,6 +74,7 @@ export default function App() {
         )
       }
     }
+    if (nextPrediction.status === 'error') setRecognitionRunning(false)
     setPrediction(nextPrediction)
     if (nextPrediction.status === 'recognized') {
       setRecentPredictions((current) => [nextPrediction, ...current].slice(0, 5))
@@ -80,35 +87,19 @@ export default function App() {
       ) {
         setSentence((current) => `${current}${nextPrediction.className}`)
       }
-    } else if (nextPrediction.status === 'no_sign' || nextPrediction.status === 'error') {
+    } else {
       processor.current.reset()
     }
   }, [settings.confidenceThreshold, settings.recognitionCooldownMs])
 
   useEffect(() => {
     if (!recognitionRunning) return
-    if (recognitionMode === 'demo') {
-      return new MockRecognitionService().start(processPrediction)
-    }
     if (!camera.stream) {
       setRecognitionRunning(false)
       return
     }
     return new WebSocketRecognitionService().start(processPrediction, camera.stream)
-  }, [camera.stream, recognitionMode, recognitionRunning, processPrediction])
-
-  function handleManualPrediction(character: string) {
-    const manualPrediction: Prediction = {
-      className: character,
-      confidence: 0.96,
-      timestamp: Date.now(),
-      status: 'recognized',
-      source: 'mock',
-    }
-    setPrediction(manualPrediction)
-    setRecentPredictions((current) => [manualPrediction, ...current].slice(0, 5))
-    setSentence((current) => `${current}${character}`)
-  }
+  }, [camera.stream, recognitionRunning, processPrediction])
 
   function handleReplay(text: string) {
     speakText(text)
@@ -141,6 +132,7 @@ export default function App() {
         <DashboardHeader
           view={view}
           cameraActive={camera.status === 'active'}
+          backendHealth={backendHealth}
           onMobileMenu={() => setMobileMenuOpen((current) => !current)}
           mobileMenuOpen={mobileMenuOpen}
         />
@@ -149,8 +141,10 @@ export default function App() {
           <div className="dashboard-content">
             <div className="welcome-strip">
               <span className="welcome-icon"><HandHeart size={20} /></span>
-              <p><strong>Let’s get started.</strong> Try demo predictions or start your camera and switch to real-time CNN recognition.</p>
-              <span className="strip-label"><i /> 36-class CNN ready</span>
+              <p><strong>Let’s get started.</strong> Start your camera and recognition to see live predictions from the trained CNN.</p>
+              <span className="strip-label">
+                <i /> {backendHealth.state === 'online' ? '36-class CNN ready' : 'Waiting for CNN backend'}
+              </span>
             </div>
 
             <div className="dashboard-grid">
@@ -163,21 +157,22 @@ export default function App() {
                   selectedDeviceId={settings.cameraDeviceId}
                   onDeviceChange={(cameraDeviceId) => updateSettings({ ...settings, cameraDeviceId })}
                   onStart={() => void camera.start()}
-                  onStop={camera.stop}
+                  onStop={() => {
+                    setRecognitionRunning(false)
+                    camera.stop()
+                  }}
                 />
                 <SentenceBuilder
                   sentence={sentence}
                   onSentenceChange={updateSentence}
                   settings={settings}
-                  voices={speech.voices}
                   speechStatus={speech.status}
                   speechError={speech.error}
-                  speechAvailable={speech.speechAvailable}
+                  needsUserPlay={speech.needsUserPlay}
                   onSettingsChange={updateSettings}
                   onSpeak={speakText}
+                  onPlay={speech.play}
                   onStop={speech.stop}
-                  onPause={speech.pause}
-                  onResume={speech.resume}
                 />
               </div>
               <div className="dashboard-column recognition-column">
@@ -186,24 +181,17 @@ export default function App() {
                   recent={recentPredictions}
                   recognitionRunning={recognitionRunning}
                   onToggleRecognition={() => setRecognitionRunning((running) => !running)}
-                  recognitionMode={recognitionMode}
-                  onRecognitionModeChange={(mode) => {
-                    setRecognitionRunning(false)
-                    setRecognitionMode(mode)
-                    setPrediction(null)
-                    processor.current.reset()
-                  }}
                   cameraAvailable={camera.status === 'active' && camera.stream !== null}
-                  onManualPrediction={handleManualPrediction}
                   confidenceThreshold={settings.confidenceThreshold}
+                  backendReady={backendHealth.state === 'online' && backendHealth.modelLoaded}
                 />
                 <div className="integration-card">
                   <div className="integration-card-top">
                     <span className="integration-icon"><ArrowUpRight size={17} /></span>
                     <span className="integration-label">READY FOR WHAT’S NEXT</span>
                   </div>
-                  <strong>Demo or live CNN recognition.</strong>
-                  <p>Run the real-time backend locally to recognize camera frames with your trained model. Demo mode remains available.</p>
+                  <strong>Live sign recognition.</strong>
+                  <p>Camera frames run through the loaded checkpoint on the local backend only while recognition is active.</p>
                   <button className="integration-link" onClick={() => navigate('settings')}>
                     Explore preferences <ArrowUpRight size={14} />
                   </button>
@@ -235,8 +223,6 @@ export default function App() {
           <div className="subpage-content">
             <SettingsPage
               settings={settings}
-              voices={speech.voices}
-              speechAvailable={speech.speechAvailable}
               onChange={updateSettings}
             />
             <footer className="page-footer settings-footer">
@@ -247,7 +233,7 @@ export default function App() {
         )}
       </main>
       <div className="sr-only" aria-live="polite">
-        {prediction?.status === 'recognized' ? `${prediction.source === 'mock' ? 'Demo' : 'CNN'} prediction ${prediction.className}, ${Math.round(prediction.confidence * 100)} percent confidence` : ''}
+        {prediction?.status === 'recognized' ? `CNN prediction ${prediction.className}, ${Math.round(prediction.confidence * 100)} percent confidence` : ''}
       </div>
     </div>
   )
